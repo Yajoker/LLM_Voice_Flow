@@ -12,12 +12,20 @@ include_directories(
     ${ALSA_INCLUDE_DIRS}
 )
 
-#include_directories(/home/sorbai/work/LLM_Voice_Flow/zmq-comm-kit/include)
+set(ZMQ_COMM_DIR ${CMAKE_SOURCE_DIR}/../zmq-comm-kit)
+set(ZMQ_COMM_SOURCES
+    ${ZMQ_COMM_DIR}/src/ZmqInterface.cpp
+    ${ZMQ_COMM_DIR}/src/ZmqServer.cpp
+    ${ZMQ_COMM_DIR}/src/ZmqClient.cpp
+    ${ZMQ_COMM_DIR}/src/ZmqPusher.cpp
+    ${ZMQ_COMM_DIR}/src/ZmqPuller.cpp
+)
 
 file(GLOB SOURCES tts_server/src/*.cpp)
 
 add_executable(tts_server
                 ${SOURCES}
+                ${ZMQ_COMM_SOURCES}
                ./test/main.cpp
                ./src/tn/glog/src/demangle.cc
                ./src/tn/glog/src/logging.cc
@@ -94,7 +102,8 @@ target_include_directories(tts_server PUBLIC ./eigen-3.4.0
                                             ./src/tn/header
                                               ./include
                                               ./src/header  
-                                              ./tts_server/include)
+                                              ./tts_server/include
+                                              ${ZMQ_COMM_DIR}/include)
 
-target_link_libraries(tts_server    /usr/local/lib/libzmq_component.so  zmq portaudio asound)
+target_link_libraries(tts_server zmq portaudio asound)
 

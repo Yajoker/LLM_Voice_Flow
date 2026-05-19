@@ -1,1 +1,14 @@
-build
+build/
+Build/
+**/build/
+**/.cache/
+tts/output_wav/
+
+# 本地 MiMo 配置（含 API Key），仅提交 mimo.ini.example
+llm_mimo/config/mimo.ini
+
+# 编译产物
+*.o
+*.a
+*.so
+*.dylib

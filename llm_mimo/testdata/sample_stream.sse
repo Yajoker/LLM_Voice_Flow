@@ -1,0 +1,10 @@
+data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"2","choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
+
+data: {"id":"3","choices":[{"index":0,"delta":{"content":"好"},"finish_reason":null}]}
+
+data: {"id":"4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

@@ -13,6 +13,8 @@ add_library(zmq_component SHARED
     src/ZmqInterface.cpp
     src/ZmqServer.cpp
     src/ZmqClient.cpp
+    src/ZmqPusher.cpp
+    src/ZmqPuller.cpp
 )
 
 target_link_libraries(zmq_component

@@ -1,0 +1,31 @@
+; 小米 MiMo 开放平台 — 与控制台「套餐权益」对齐的配置示例
+; 复制为 config/mimo.ini 后按需修改；API Key 请只用环境变量 MIMO_API_KEY
+
+[api]
+; 必填：控制台「专属 Base URL」→ OpenAI 兼容（示例为 token-plan-sgp 线路）
+base_url = https://token-plan-sgp.xiaomimimo.com/v1
+
+; 对话模型（套餐权益内，用于 chat/completions）：
+;   mimo-v2.5-pro   — MiMo-V2.5-Pro，复杂推理
+;   mimo-v2.5       — MiMo-V2.5，语音对话默认推荐
+;   mimo-v2-pro     — MiMo-V2-Pro
+;   mimo-v2-omni    — MiMo-V2-Omni，多模态
+; 以下仅 TTS，勿用于本模块：
+;   mimo-v2.5-tts / mimo-v2.5-tts-voiceclone / mimo-v2.5-tts-voicedesign / mimo-v2-tts
+; 注意：套餐不含 MiMo-V2-Flash，勿配置 mimo-v2-flash
+model = mimo-v2.5
+
+api_key_env = MIMO_API_KEY
+temperature = 0.7
+max_tokens = 256
+
+[timeout]
+connect_timeout_ms = 5000
+read_idle_timeout_ms = 30000
+turn_timeout_ms = 60000
+
+[zmq]
+; VOICE 模块 REQ 连接的 LLM REP 地址（本进程 bind）
+voice_rep_bind = tcp://*:6666
+; 本进程 PUSH 到 TTS 的 PULL（TTS bind 7777）
+tts_push_connect = tcp://localhost:7777
