@@ -1,350 +1,620 @@
 // 太空探测与动态几何体查询 —— 加速版 (BVH + 命中后刷新包围盒)
 // ---------------------------------------------------------------------------
-// 与暴力版判定逻辑完全一致，但用 BVH 做空间剪枝：
-//   - 建树一次；每次查询沿射线遍历 BVH，按包围盒入射 t 剪枝，找最近命中；
-//   - 物体被推动后只重算其叶子 AABB 并自底向上刷新祖先 AABB(始终保守正确)；
-//   - 平局规则：t 相等(容差内)取编号最小者；剪枝阈值带容差，避免漏掉同 t 小编号。
-// 复杂度约 O((n+q)·log n)（包围盒变松时退化，但结果恒正确）。
+// 与暴力版判定逻辑完全一致, 但用 BVH 做空间剪枝:
+//   - 建树一次; 每次查询沿射线遍历 BVH, 按包围盒入射 t 剪枝, 找最近命中;
+//   - 物体被推动后只重算其叶子 AABB 并自底向上刷新祖先 AABB (始终保守正确);
+//   - 平局规则: t 相等(容差内)取编号最小者; 剪枝阈值带容差, 避免漏掉同 t 小编号.
+// 复杂度约 O((n+q)*log n) (包围盒变松时退化, 但结果恒正确).
+// 标准: C++17.
 // ---------------------------------------------------------------------------
-#include <bits/stdc++.h>
-using namespace std;
-typedef long double ld;
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 
-static const ld EPS = 1e-9L;
+using ld = long double;
 
-struct FastIn {
-    static const int S = 1 << 16;
-    char buf[S];
-    int len = 0, pos = 0;
-    int gc() {
-        if (pos == len) { len = (int)fread(buf, 1, S, stdin); pos = 0; if (len == 0) return -1; }
-        return buf[pos++];
-    }
+namespace {
+
+constexpr ld kEps = 1e-9L;
+constexpr ld kInf = 1e300L;
+
+// ----------------------------- 快速输入 -----------------------------
+class FastInput {
+public:
     bool readLL(long long &out) {
         int c = gc();
-        while (c != -1 && c != '-' && (c < '0' || c > '9')) c = gc();
-        if (c == -1) return false;
-        bool neg = false; if (c == '-') { neg = true; c = gc(); }
-        long long x = 0; while (c >= '0' && c <= '9') { x = x * 10 + (c - '0'); c = gc(); }
-        out = neg ? -x : x; return true;
+        while (c != -1 && c != '-' && (c < '0' || c > '9')) {
+            c = gc();
+        }
+        if (c == -1) {
+            return false;
+        }
+        bool neg = false;
+        if (c == '-') {
+            neg = true;
+            c = gc();
+        }
+        long long x = 0;
+        while (c >= '0' && c <= '9') {
+            x = x * 10 + (c - '0');
+            c = gc();
+        }
+        out = neg ? -x : x;
+        return true;
     }
-} in;
 
-vector<int> objType;
-vector<long long> objOff;
-vector<double> P;
+private:
+    static constexpr int kBufSize = 1 << 16;
+    char buf_[kBufSize];
+    int len_ = 0;
+    int pos_ = 0;
 
-static inline ld dot3(ld ax, ld ay, ld az, ld bx, ld by, ld bz) { return ax * bx + ay * by + az * bz; }
-
-// ----------------------- 精确命中判定 (与暴力版一致) -----------------------
-bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
-    long long o = objOff[i];
-    int tp = objType[i];
-    if (tp == 0) {
-        ld cx = P[o], cy = P[o + 1], cz = P[o + 2], r = P[o + 3];
-        ld mx = ox - cx, my = oy - cy, mz = oz - cz;
-        ld c = dot3(mx, my, mz, mx, my, mz) - r * r;
-        if (c <= EPS) { tout = 0; return true; }
-        ld a = dot3(dx, dy, dz, dx, dy, dz);
-        ld b = 2 * dot3(mx, my, mz, dx, dy, dz);
-        ld disc = b * b - 4 * a * c;
-        if (disc < 0) return false;
-        ld sq = sqrtl(disc);
-        ld t0 = (-b - sq) / (2 * a);
-        if (t0 >= -EPS) { tout = t0 > 0 ? t0 : 0; return true; }
-        return false;
-    }
-    if (tp == 1) {
-        ld cx = P[o], cy = P[o + 1], cz = P[o + 2];
-        ld ax = P[o + 3], ay = P[o + 4], az = P[o + 5];
-        ld bx = P[o + 6], by = P[o + 7], bz = P[o + 8];
-        ld wx = P[o + 9], wy = P[o + 10], wz = P[o + 11];
-        ld mx = ox - cx, my = oy - cy, mz = oz - cz;
-        ld tmin = -1e300L, tmax = 1e300L;
-        bool inside = true;
-        const ld axv[3][3] = {{ax, ay, az}, {bx, by, bz}, {wx, wy, wz}};
-        for (int k = 0; k < 3; ++k) {
-            ld vx = axv[k][0], vy = axv[k][1], vz = axv[k][2];
-            ld aa = dot3(vx, vy, vz, vx, vy, vz);
-            ld om = dot3(mx, my, mz, vx, vy, vz);
-            ld dm = dot3(dx, dy, dz, vx, vy, vz);
-            if (fabsl(om) > aa + EPS) inside = false;
-            if (fabsl(dm) <= EPS) { if (om < -aa - EPS || om > aa + EPS) return false; }
-            else {
-                ld t1 = (-aa - om) / dm, t2 = (aa - om) / dm; if (t1 > t2) swap(t1, t2);
-                if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2;
-                if (tmin > tmax + EPS) return false;
+    int gc() {
+        if (pos_ == len_) {
+            len_ = static_cast<int>(std::fread(buf_, 1, kBufSize, stdin));
+            pos_ = 0;
+            if (len_ == 0) {
+                return -1;
             }
         }
-        if (inside) { tout = 0; return true; }
-        if (tmax < -EPS) return false;
-        ld t = tmin > 0 ? tmin : 0;
-        if (t > tmax + EPS) return false;
-        tout = t; return true;
+        return buf_[pos_++];
     }
-    if (tp == 2) {
-        ld cx = P[o], cy = P[o + 1], cz = P[o + 2];
-        ld axv = P[o + 3], ayv = P[o + 4], azv = P[o + 5];
-        ld r = P[o + 6], hH = P[o + 7];
-        ld mx = ox - cx, my = oy - cy, mz = oz - cz;
-        ld la = sqrtl(dot3(axv, ayv, azv, axv, ayv, azv));
-        ld hx = axv / la, hy = ayv / la, hz = azv / la;
-        ld oa = dot3(mx, my, mz, hx, hy, hz);
-        ld da = dot3(dx, dy, dz, hx, hy, hz);
-        ld opx = mx - oa * hx, opy = my - oa * hy, opz = mz - oa * hz;
-        ld dpx = dx - da * hx, dpy = dy - da * hy, dpz = dz - da * hz;
-        ld op2 = dot3(opx, opy, opz, opx, opy, opz);
-        if (fabsl(oa) <= hH + EPS && op2 <= r * r + EPS) { tout = 0; return true; }
-        ld best = 1e300L;
-        ld A = dot3(dpx, dpy, dpz, dpx, dpy, dpz);
-        ld B = 2 * dot3(opx, opy, opz, dpx, dpy, dpz);
-        ld C0 = op2 - r * r;
-        if (A > EPS) {
-            ld disc = B * B - 4 * A * C0;
+};
+
+// ----------------------------- 物体存储 -----------------------------
+// 用一个扁平数组保存全部参数, g_off[i] 指向第 i 个物体参数起点.
+// 参数布局:
+//   球体 (type 0): cx cy cz r                              (4)
+//   长方体(type 1): cx cy cz ux uy uz vx vy vz wx wy wz     (12)
+//   圆柱体(type 2): cx cy cz ax ay az r halfH               (8)
+//   三角片(type 3): v1x v1y v1z v2x v2y v2z v3x v3y v3z     (9)
+std::vector<int> g_type;
+std::vector<long long> g_off;
+std::vector<double> g_param;
+
+inline ld dot3(ld ax, ld ay, ld az, ld bx, ld by, ld bz) {
+    return ax * bx + ay * by + az * bz;
+}
+
+// 命中: 若射线命中第 i 个物体则返回 true, 并将命中参数 t(>=0) 写入 tout.
+bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
+    const long long o = g_off[i];
+    const int tp = g_type[i];
+
+    if (tp == 0) {  // ---------- 球体 ----------
+        const ld cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const ld r = g_param[o + 3];
+        const ld mx = ox - cx, my = oy - cy, mz = oz - cz;
+        const ld c = dot3(mx, my, mz, mx, my, mz) - r * r;
+        if (c <= kEps) {  // 起点在内部/边界
+            tout = 0;
+            return true;
+        }
+        const ld a = dot3(dx, dy, dz, dx, dy, dz);
+        const ld b = 2 * dot3(mx, my, mz, dx, dy, dz);
+        const ld disc = b * b - 4 * a * c;
+        if (disc < 0) {
+            return false;
+        }
+        const ld t0 = (-b - std::sqrt(disc)) / (2 * a);  // 近交点
+        if (t0 >= -kEps) {
+            tout = t0 > 0 ? t0 : 0;
+            return true;
+        }
+        return false;  // 两根均为负 -> 射线背向
+    }
+
+    if (tp == 1) {  // ---------- OBB 长方体 (slab 法, 用非单位轴避免开方) ----------
+        const ld cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const ld mx = ox - cx, my = oy - cy, mz = oz - cz;
+
+        const ld axis[3][3] = {
+            {g_param[o + 3], g_param[o + 4], g_param[o + 5]},
+            {g_param[o + 6], g_param[o + 7], g_param[o + 8]},
+            {g_param[o + 9], g_param[o + 10], g_param[o + 11]},
+        };
+
+        ld tmin = -kInf;
+        ld tmax = kInf;
+        bool inside = true;
+        for (int k = 0; k < 3; ++k) {
+            const ld vx = axis[k][0], vy = axis[k][1], vz = axis[k][2];
+            const ld aa = dot3(vx, vy, vz, vx, vy, vz);  // |u|^2
+            const ld om = dot3(mx, my, mz, vx, vy, vz);  // (O-C)·u
+            const ld dm = dot3(dx, dy, dz, vx, vy, vz);  // D·u
+            if (std::fabs(om) > aa + kEps) {
+                inside = false;
+            }
+            if (std::fabs(dm) <= kEps) {  // 射线平行于该 slab
+                if (om < -aa - kEps || om > aa + kEps) {
+                    return false;
+                }
+            } else {
+                ld t1 = (-aa - om) / dm;
+                ld t2 = (aa - om) / dm;
+                if (t1 > t2) {
+                    std::swap(t1, t2);
+                }
+                if (t1 > tmin) {
+                    tmin = t1;
+                }
+                if (t2 < tmax) {
+                    tmax = t2;
+                }
+                if (tmin > tmax + kEps) {
+                    return false;
+                }
+            }
+        }
+        if (inside) {
+            tout = 0;
+            return true;
+        }
+        if (tmax < -kEps) {
+            return false;
+        }
+        const ld t = tmin > 0 ? tmin : 0;
+        if (t > tmax + kEps) {
+            return false;
+        }
+        tout = t;
+        return true;
+    }
+
+    if (tp == 2) {  // ---------- 圆柱体 (侧面 + 两个端盖) ----------
+        const ld cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const ld ax = g_param[o + 3], ay = g_param[o + 4], az = g_param[o + 5];
+        const ld r = g_param[o + 6], halfH = g_param[o + 7];
+        const ld mx = ox - cx, my = oy - cy, mz = oz - cz;
+
+        const ld la = std::sqrt(dot3(ax, ay, az, ax, ay, az));  // 轴长 (保证非零)
+        const ld hx = ax / la, hy = ay / la, hz = az / la;      // 单位轴
+        const ld oa = dot3(mx, my, mz, hx, hy, hz);             // 沿轴坐标(起点)
+        const ld da = dot3(dx, dy, dz, hx, hy, hz);             // 沿轴方向分量
+        const ld opx = mx - oa * hx, opy = my - oa * hy, opz = mz - oa * hz;  // 起点径向
+        const ld dpx = dx - da * hx, dpy = dy - da * hy, dpz = dz - da * hz;  // 方向径向
+        const ld op2 = dot3(opx, opy, opz, opx, opy, opz);
+
+        if (std::fabs(oa) <= halfH + kEps && op2 <= r * r + kEps) {
+            tout = 0;
+            return true;
+        }
+
+        ld best = kInf;
+
+        // 侧面: |径向(t)|^2 = r^2
+        const ld a = dot3(dpx, dpy, dpz, dpx, dpy, dpz);
+        const ld b = 2 * dot3(opx, opy, opz, dpx, dpy, dpz);
+        const ld c0 = op2 - r * r;
+        if (a > kEps) {
+            const ld disc = b * b - 4 * a * c0;
             if (disc >= 0) {
-                ld sq = sqrtl(disc);
-                ld roots[2] = {(-B - sq) / (2 * A), (-B + sq) / (2 * A)};
+                const ld sq = std::sqrt(disc);
+                const ld roots[2] = {(-b - sq) / (2 * a), (-b + sq) / (2 * a)};
                 for (int s = 0; s < 2; ++s) {
-                    ld root = roots[s];
-                    if (root >= -EPS) {
-                        ld sAxis = oa + root * da;
-                        if (sAxis >= -hH - EPS && sAxis <= hH + EPS) { ld rr = root > 0 ? root : 0; if (rr < best) best = rr; }
+                    const ld root = roots[s];
+                    if (root >= -kEps) {
+                        const ld sAxis = oa + root * da;  // 命中点沿轴坐标
+                        if (sAxis >= -halfH - kEps && sAxis <= halfH + kEps) {
+                            const ld rr = root > 0 ? root : 0;
+                            if (rr < best) {
+                                best = rr;
+                            }
+                        }
                     }
                 }
             }
         }
-        for (int cc = 0; cc < 2; ++cc) {
-            ld sc = (cc == 0) ? hH : -hH;
-            if (fabsl(da) > EPS) {
-                ld tc = (sc - oa) / da;
-                if (tc >= -EPS) {
-                    ld px = opx + tc * dpx, py = opy + tc * dpy, pz = opz + tc * dpz;
-                    if (dot3(px, py, pz, px, py, pz) <= r * r + EPS) { ld rr = tc > 0 ? tc : 0; if (rr < best) best = rr; }
+
+        // 端盖: 平面 沿轴坐标 = ±halfH, 命中点径向距离 <= r
+        for (int cap = 0; cap < 2; ++cap) {
+            const ld sc = (cap == 0) ? halfH : -halfH;
+            if (std::fabs(da) > kEps) {
+                const ld tc = (sc - oa) / da;
+                if (tc >= -kEps) {
+                    const ld px = opx + tc * dpx;
+                    const ld py = opy + tc * dpy;
+                    const ld pz = opz + tc * dpz;
+                    if (dot3(px, py, pz, px, py, pz) <= r * r + kEps) {
+                        const ld rr = tc > 0 ? tc : 0;
+                        if (rr < best) {
+                            best = rr;
+                        }
+                    }
                 }
             }
         }
-        if (best < 1e299L) { tout = best; return true; }
+
+        if (best < kInf * 0.5L) {
+            tout = best;
+            return true;
+        }
         return false;
     }
-    ld v1x = P[o], v1y = P[o + 1], v1z = P[o + 2];
-    ld v2x = P[o + 3], v2y = P[o + 4], v2z = P[o + 5];
-    ld v3x = P[o + 6], v3y = P[o + 7], v3z = P[o + 8];
-    ld e1x = v2x - v1x, e1y = v2y - v1y, e1z = v2z - v1z;
-    ld e2x = v3x - v1x, e2y = v3y - v1y, e2z = v3z - v1z;
-    ld px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
-    ld det = e1x * px + e1y * py + e1z * pz;
-    if (fabsl(det) <= EPS) return false;
-    ld inv = 1.0L / det;
-    ld sx = ox - v1x, sy = oy - v1y, sz = oz - v1z;
-    ld u = (sx * px + sy * py + sz * pz) * inv;
-    if (u < -EPS || u > 1 + EPS) return false;
-    ld qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x;
-    ld v = (dx * qx + dy * qy + dz * qz) * inv;
-    if (v < -EPS || u + v > 1 + EPS) return false;
-    ld t = (e2x * qx + e2y * qy + e2z * qz) * inv;
-    if (t >= -EPS) { tout = t > 0 ? t : 0; return true; }
+
+    // ---------- 三角面片 (Möller–Trumbore) ----------
+    const ld v1x = g_param[o], v1y = g_param[o + 1], v1z = g_param[o + 2];
+    const ld v2x = g_param[o + 3], v2y = g_param[o + 4], v2z = g_param[o + 5];
+    const ld v3x = g_param[o + 6], v3y = g_param[o + 7], v3z = g_param[o + 8];
+    const ld e1x = v2x - v1x, e1y = v2y - v1y, e1z = v2z - v1z;
+    const ld e2x = v3x - v1x, e2y = v3y - v1y, e2z = v3z - v1z;
+
+    const ld px = dy * e2z - dz * e2y;  // pvec = D × e2
+    const ld py = dz * e2x - dx * e2z;
+    const ld pz = dx * e2y - dy * e2x;
+    const ld det = e1x * px + e1y * py + e1z * pz;
+    if (std::fabs(det) <= kEps) {  // 射线与三角形共面 -> 视为不相交
+        return false;
+    }
+    const ld inv = 1.0L / det;
+
+    const ld sx = ox - v1x, sy = oy - v1y, sz = oz - v1z;
+    const ld u = (sx * px + sy * py + sz * pz) * inv;
+    if (u < -kEps || u > 1 + kEps) {
+        return false;
+    }
+
+    const ld qx = sy * e1z - sz * e1y;  // qvec = s × e1
+    const ld qy = sz * e1x - sx * e1z;
+    const ld qz = sx * e1y - sy * e1x;
+    const ld v = (dx * qx + dy * qy + dz * qz) * inv;
+    if (v < -kEps || u + v > 1 + kEps) {
+        return false;
+    }
+
+    const ld t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+    if (t >= -kEps) {
+        tout = t > 0 ? t : 0;
+        return true;
+    }
     return false;
 }
 
-// ----------------------- 物体 AABB -----------------------
+// ----------------------------- 物体 AABB -----------------------------
 void objAABB(int i, double lo[3], double hi[3]) {
-    long long o = objOff[i];
-    int tp = objType[i];
+    const long long o = g_off[i];
+    const int tp = g_type[i];
     if (tp == 0) {
-        double cx = P[o], cy = P[o + 1], cz = P[o + 2], r = P[o + 3];
-        lo[0] = cx - r; hi[0] = cx + r; lo[1] = cy - r; hi[1] = cy + r; lo[2] = cz - r; hi[2] = cz + r;
+        const double cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const double r = g_param[o + 3];
+        lo[0] = cx - r; hi[0] = cx + r;
+        lo[1] = cy - r; hi[1] = cy + r;
+        lo[2] = cz - r; hi[2] = cz + r;
     } else if (tp == 1) {
-        double cx = P[o], cy = P[o + 1], cz = P[o + 2];
-        double ex = fabs(P[o + 3]) + fabs(P[o + 6]) + fabs(P[o + 9]);
-        double ey = fabs(P[o + 4]) + fabs(P[o + 7]) + fabs(P[o + 10]);
-        double ez = fabs(P[o + 5]) + fabs(P[o + 8]) + fabs(P[o + 11]);
-        lo[0] = cx - ex; hi[0] = cx + ex; lo[1] = cy - ey; hi[1] = cy + ey; lo[2] = cz - ez; hi[2] = cz + ez;
+        const double cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const double ex = std::fabs(g_param[o + 3]) + std::fabs(g_param[o + 6]) + std::fabs(g_param[o + 9]);
+        const double ey = std::fabs(g_param[o + 4]) + std::fabs(g_param[o + 7]) + std::fabs(g_param[o + 10]);
+        const double ez = std::fabs(g_param[o + 5]) + std::fabs(g_param[o + 8]) + std::fabs(g_param[o + 11]);
+        lo[0] = cx - ex; hi[0] = cx + ex;
+        lo[1] = cy - ey; hi[1] = cy + ey;
+        lo[2] = cz - ez; hi[2] = cz + ez;
     } else if (tp == 2) {
-        double cx = P[o], cy = P[o + 1], cz = P[o + 2];
-        double ax = P[o + 3], ay = P[o + 4], az = P[o + 5], r = P[o + 6], hH = P[o + 7];
-        double la = sqrt(ax * ax + ay * ay + az * az);
-        double hx = ax / la, hy = ay / la, hz = az / la;
-        double ex = hH * fabs(hx) + r * sqrt(max(0.0, 1.0 - hx * hx));
-        double ey = hH * fabs(hy) + r * sqrt(max(0.0, 1.0 - hy * hy));
-        double ez = hH * fabs(hz) + r * sqrt(max(0.0, 1.0 - hz * hz));
-        lo[0] = cx - ex; hi[0] = cx + ex; lo[1] = cy - ey; hi[1] = cy + ey; lo[2] = cz - ez; hi[2] = cz + ez;
+        const double cx = g_param[o], cy = g_param[o + 1], cz = g_param[o + 2];
+        const double ax = g_param[o + 3], ay = g_param[o + 4], az = g_param[o + 5];
+        const double r = g_param[o + 6], halfH = g_param[o + 7];
+        const double la = std::sqrt(ax * ax + ay * ay + az * az);
+        const double hx = ax / la, hy = ay / la, hz = az / la;
+        const double ex = halfH * std::fabs(hx) + r * std::sqrt(std::max(0.0, 1.0 - hx * hx));
+        const double ey = halfH * std::fabs(hy) + r * std::sqrt(std::max(0.0, 1.0 - hy * hy));
+        const double ez = halfH * std::fabs(hz) + r * std::sqrt(std::max(0.0, 1.0 - hz * hz));
+        lo[0] = cx - ex; hi[0] = cx + ex;
+        lo[1] = cy - ey; hi[1] = cy + ey;
+        lo[2] = cz - ez; hi[2] = cz + ez;
     } else {
         for (int a = 0; a < 3; ++a) {
-            double v0 = P[o + a], v1 = P[o + 3 + a], v2 = P[o + 6 + a];
-            lo[a] = min({v0, v1, v2}); hi[a] = max({v0, v1, v2});
+            const double w0 = g_param[o + a];
+            const double w1 = g_param[o + 3 + a];
+            const double w2 = g_param[o + 6 + a];
+            lo[a] = std::min({w0, w1, w2});
+            hi[a] = std::max({w0, w1, w2});
         }
     }
-    // 给保守容差，规避浮点边界
-    for (int a = 0; a < 3; ++a) { lo[a] -= 1e-6; hi[a] += 1e-6; }
+    for (int a = 0; a < 3; ++a) {  // 给保守容差, 规避浮点边界
+        lo[a] -= 1e-6;
+        hi[a] += 1e-6;
+    }
 }
 
-// ----------------------- BVH -----------------------
-struct Node { double lo[3], hi[3]; int left, right, parent, obj; };
-vector<Node> nodes;
-vector<int> leafOf;   // objIdx -> node id
-vector<int> prim;     // 物体索引列表(建树时按区间划分)
+// ----------------------------- BVH -----------------------------
+struct Node {
+    double lo[3];
+    double hi[3];
+    int left;
+    int right;
+    int parent;
+    int obj;  // 叶子为物体下标, 内部节点为 -1
+};
+
+std::vector<Node> g_nodes;
+std::vector<int> g_leafOf;  // objIdx -> node id
+std::vector<int> g_prim;    // 物体索引列表(建树时按区间划分)
+int g_root = -1;
 
 int buildBVH(int l, int r, int parent) {
-    int id = (int)nodes.size();
-    nodes.push_back(Node());
-    nodes[id].parent = parent;
-    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    const int id = static_cast<int>(g_nodes.size());
+    g_nodes.push_back(Node());
+    g_nodes[id].parent = parent;
+
+    double lo[3] = {kInf, kInf, kInf};
+    double hi[3] = {-kInf, -kInf, -kInf};
     for (int k = l; k < r; ++k) {
-        double blo[3], bhi[3]; objAABB(prim[k], blo, bhi);
-        for (int a = 0; a < 3; ++a) { lo[a] = min(lo[a], blo[a]); hi[a] = max(hi[a], bhi[a]); }
+        double blo[3], bhi[3];
+        objAABB(g_prim[k], blo, bhi);
+        for (int a = 0; a < 3; ++a) {
+            lo[a] = std::min(lo[a], blo[a]);
+            hi[a] = std::max(hi[a], bhi[a]);
+        }
     }
-    for (int a = 0; a < 3; ++a) { nodes[id].lo[a] = lo[a]; nodes[id].hi[a] = hi[a]; }
+    for (int a = 0; a < 3; ++a) {
+        g_nodes[id].lo[a] = lo[a];
+        g_nodes[id].hi[a] = hi[a];
+    }
+
     if (r - l == 1) {
-        nodes[id].left = nodes[id].right = -1;
-        nodes[id].obj = prim[l];
-        leafOf[prim[l]] = id;
+        g_nodes[id].left = -1;
+        g_nodes[id].right = -1;
+        g_nodes[id].obj = g_prim[l];
+        g_leafOf[g_prim[l]] = id;
         return id;
     }
+
     // 选最长轴, 按质心中位数划分
-    double cen[3] = {1e300, 1e300, 1e300}, cex[3] = {-1e300, -1e300, -1e300};
+    double cenLo[3] = {kInf, kInf, kInf};
+    double cenHi[3] = {-kInf, -kInf, -kInf};
     for (int k = l; k < r; ++k) {
-        double blo[3], bhi[3]; objAABB(prim[k], blo, bhi);
-        for (int a = 0; a < 3; ++a) { double c = (blo[a] + bhi[a]) * 0.5; cen[a] = min(cen[a], c); cex[a] = max(cex[a], c); }
+        double blo[3], bhi[3];
+        objAABB(g_prim[k], blo, bhi);
+        for (int a = 0; a < 3; ++a) {
+            const double c = (blo[a] + bhi[a]) * 0.5;
+            cenLo[a] = std::min(cenLo[a], c);
+            cenHi[a] = std::max(cenHi[a], c);
+        }
     }
-    int axis = 0; double best = cex[0] - cen[0];
-    for (int a = 1; a < 3; ++a) if (cex[a] - cen[a] > best) { best = cex[a] - cen[a]; axis = a; }
-    int mid = (l + r) / 2;
-    if (best < 1e-12) {
-        // 质心几乎相同 -> 按下标对半分, 保证深度有界
-    } else {
-        nth_element(prim.begin() + l, prim.begin() + mid, prim.begin() + r,
-                    [&](int x, int y) {
-                        double xl[3], xh[3], yl[3], yh[3]; objAABB(x, xl, xh); objAABB(y, yl, yh);
-                        return (xl[axis] + xh[axis]) < (yl[axis] + yh[axis]);
-                    });
+    int axis = 0;
+    double bestSpan = cenHi[0] - cenLo[0];
+    for (int a = 1; a < 3; ++a) {
+        if (cenHi[a] - cenLo[a] > bestSpan) {
+            bestSpan = cenHi[a] - cenLo[a];
+            axis = a;
+        }
     }
-    nodes[id].obj = -1;
-    int lc = buildBVH(l, mid, id);
-    int rc = buildBVH(mid, r, id);
-    nodes[id].left = lc; nodes[id].right = rc;
+
+    const int mid = (l + r) / 2;
+    if (bestSpan >= 1e-12) {  // 质心几乎相同时直接按下标对半分, 保证深度有界
+        std::nth_element(g_prim.begin() + l, g_prim.begin() + mid, g_prim.begin() + r,
+                         [&](int x, int y) {
+                             double xl[3], xh[3], yl[3], yh[3];
+                             objAABB(x, xl, xh);
+                             objAABB(y, yl, yh);
+                             return (xl[axis] + xh[axis]) < (yl[axis] + yh[axis]);
+                         });
+    }
+
+    g_nodes[id].obj = -1;
+    const int lc = buildBVH(l, mid, id);
+    const int rc = buildBVH(mid, r, id);
+    g_nodes[id].left = lc;
+    g_nodes[id].right = rc;
     return id;
 }
 
 void refit(int objIdx) {
-    int id = leafOf[objIdx];
-    double lo[3], hi[3]; objAABB(objIdx, lo, hi);
-    for (int a = 0; a < 3; ++a) { nodes[id].lo[a] = lo[a]; nodes[id].hi[a] = hi[a]; }
-    id = nodes[id].parent;
+    int id = g_leafOf[objIdx];
+    double lo[3], hi[3];
+    objAABB(objIdx, lo, hi);
+    for (int a = 0; a < 3; ++a) {
+        g_nodes[id].lo[a] = lo[a];
+        g_nodes[id].hi[a] = hi[a];
+    }
+    id = g_nodes[id].parent;
     while (id != -1) {
-        int lc = nodes[id].left, rc = nodes[id].right;
+        const int lc = g_nodes[id].left;
+        const int rc = g_nodes[id].right;
         bool changed = false;
         for (int a = 0; a < 3; ++a) {
-            double nlo = min(nodes[lc].lo[a], nodes[rc].lo[a]);
-            double nhi = max(nodes[lc].hi[a], nodes[rc].hi[a]);
-            if (nlo != nodes[id].lo[a] || nhi != nodes[id].hi[a]) changed = true;
-            nodes[id].lo[a] = nlo; nodes[id].hi[a] = nhi;
+            const double nlo = std::min(g_nodes[lc].lo[a], g_nodes[rc].lo[a]);
+            const double nhi = std::max(g_nodes[lc].hi[a], g_nodes[rc].hi[a]);
+            if (nlo != g_nodes[id].lo[a] || nhi != g_nodes[id].hi[a]) {
+                changed = true;
+            }
+            g_nodes[id].lo[a] = nlo;
+            g_nodes[id].hi[a] = nhi;
         }
-        if (!changed) break;
-        id = nodes[id].parent;
+        if (!changed) {
+            break;
+        }
+        id = g_nodes[id].parent;
     }
 }
 
 // 射线-AABB: 返回是否相交(t>=0), tEnter 为入射参数(起点在盒内则 0)
 inline bool rayAABB(const Node &nd, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tEnter) {
-    ld O[3] = {ox, oy, oz}, D[3] = {dx, dy, dz};
-    ld tmin = 0, tmax = 1e300L;
+    const ld O[3] = {ox, oy, oz};
+    const ld D[3] = {dx, dy, dz};
+    ld tmin = 0;
+    ld tmax = kInf;
     for (int a = 0; a < 3; ++a) {
-        if (fabsl(D[a]) <= EPS) {
-            if (O[a] < (ld)nd.lo[a] - EPS || O[a] > (ld)nd.hi[a] + EPS) return false;
+        if (std::fabs(D[a]) <= kEps) {
+            if (O[a] < static_cast<ld>(nd.lo[a]) - kEps || O[a] > static_cast<ld>(nd.hi[a]) + kEps) {
+                return false;
+            }
         } else {
-            ld inv = 1.0L / D[a];
-            ld ta = ((ld)nd.lo[a] - O[a]) * inv;
-            ld tb = ((ld)nd.hi[a] - O[a]) * inv;
-            if (ta > tb) swap(ta, tb);
-            if (ta > tmin) tmin = ta;
-            if (tb < tmax) tmax = tb;
-            if (tmin > tmax + EPS) return false;
+            const ld inv = 1.0L / D[a];
+            ld ta = (static_cast<ld>(nd.lo[a]) - O[a]) * inv;
+            ld tb = (static_cast<ld>(nd.hi[a]) - O[a]) * inv;
+            if (ta > tb) {
+                std::swap(ta, tb);
+            }
+            if (ta > tmin) {
+                tmin = ta;
+            }
+            if (tb < tmax) {
+                tmax = tb;
+            }
+            if (tmin > tmax + kEps) {
+                return false;
+            }
         }
     }
-    if (tmax < -EPS) return false;
+    if (tmax < -kEps) {
+        return false;
+    }
     tEnter = tmin;
     return true;
 }
 
-int rootNode;
-
 void query(ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &bestT, int &bestIdx) {
-    bestT = 1e300L; bestIdx = -1;
-    static vector<int> stk; stk.clear();
+    bestT = kInf;
+    bestIdx = -1;
+
+    static std::vector<int> stk;
+    stk.clear();
+
     ld rootEnter;
-    if (!rayAABB(nodes[rootNode], ox, oy, oz, dx, dy, dz, rootEnter)) return;
-    stk.push_back(rootNode);
+    if (!rayAABB(g_nodes[g_root], ox, oy, oz, dx, dy, dz, rootEnter)) {
+        return;
+    }
+    stk.push_back(g_root);
+
     while (!stk.empty()) {
-        int id = stk.back(); stk.pop_back();
-        const Node &nd = nodes[id];
-        ld tol = 1e-9L * fmaxl((ld)1.0L, fabsl(bestT));
+        const int id = stk.back();
+        stk.pop_back();
+        const Node &nd = g_nodes[id];
+
         if (bestIdx != -1) {
-            ld e;
-            if (!rayAABB(nd, ox, oy, oz, dx, dy, dz, e)) continue;
-            if (e > bestT + tol) continue;  // 整个盒都比当前最优更远 -> 剪枝
+            const ld tol = 1e-9L * std::fmax(static_cast<ld>(1.0L), std::fabs(bestT));
+            ld enter;
+            if (!rayAABB(nd, ox, oy, oz, dx, dy, dz, enter)) {
+                continue;
+            }
+            if (enter > bestT + tol) {  // 整个盒都比当前最优更远 -> 剪枝
+                continue;
+            }
         }
+
         if (nd.obj >= 0) {  // 叶子
             ld t;
             if (hitObj(nd.obj, ox, oy, oz, dx, dy, dz, t)) {
-                ld tt = 1e-9L * fmaxl((ld)1.0L, fmaxl(fabsl(t), fabsl(bestT)));
-                if (bestIdx == -1 || t < bestT - tt) { bestT = t; bestIdx = nd.obj; }
-                else if (fabsl(t - bestT) <= tt && nd.obj < bestIdx) { bestIdx = nd.obj; }
+                const ld tol = 1e-9L * std::fmax(static_cast<ld>(1.0L), std::fmax(std::fabs(t), std::fabs(bestT)));
+                if (bestIdx == -1 || t < bestT - tol) {
+                    bestT = t;
+                    bestIdx = nd.obj;
+                } else if (std::fabs(t - bestT) <= tol && nd.obj < bestIdx) {
+                    bestIdx = nd.obj;
+                }
             }
             continue;
         }
+
         // 先入栈较远者, 后处理较近者(后进先出)
-        int lc = nd.left, rc = nd.right;
-        ld el, er; bool hl = rayAABB(nodes[lc], ox, oy, oz, dx, dy, dz, el);
-        bool hr = rayAABB(nodes[rc], ox, oy, oz, dx, dy, dz, er);
+        const int lc = nd.left;
+        const int rc = nd.right;
+        ld el, er;
+        const bool hl = rayAABB(g_nodes[lc], ox, oy, oz, dx, dy, dz, el);
+        const bool hr = rayAABB(g_nodes[rc], ox, oy, oz, dx, dy, dz, er);
         if (hl && hr) {
-            if (el <= er) { stk.push_back(rc); stk.push_back(lc); }
-            else { stk.push_back(lc); stk.push_back(rc); }
-        } else if (hl) stk.push_back(lc);
-        else if (hr) stk.push_back(rc);
+            if (el <= er) {
+                stk.push_back(rc);
+                stk.push_back(lc);
+            } else {
+                stk.push_back(lc);
+                stk.push_back(rc);
+            }
+        } else if (hl) {
+            stk.push_back(lc);
+        } else if (hr) {
+            stk.push_back(rc);
+        }
     }
 }
 
+}  // namespace
+
 int main() {
-    long long n, q;
-    if (!in.readLL(n)) return 0;
+    FastInput in;
+
+    long long n = 0, q = 0;
+    if (!in.readLL(n)) {
+        return 0;
+    }
     in.readLL(q);
-    objType.resize(n); objOff.resize(n); P.reserve((size_t)n * 6 + 16);
+
+    g_type.resize(n);
+    g_off.resize(n);
+    g_param.reserve(static_cast<std::size_t>(n) * 6 + 16);
+
     for (int i = 0; i < n; ++i) {
-        long long tp; in.readLL(tp);
-        objType[i] = (int)tp; objOff[i] = (long long)P.size();
-        int cnt = (tp == 0) ? 4 : (tp == 1) ? 12 : (tp == 2) ? 8 : 9;
-        for (int k = 0; k < cnt; ++k) { long long val; in.readLL(val); P.push_back((double)val); }
+        long long tp = 0;
+        in.readLL(tp);
+        g_type[i] = static_cast<int>(tp);
+        g_off[i] = static_cast<long long>(g_param.size());
+        const int cnt = (tp == 0) ? 4 : (tp == 1) ? 12 : (tp == 2) ? 8 : 9;
+        for (int k = 0; k < cnt; ++k) {
+            long long val = 0;
+            in.readLL(val);
+            g_param.push_back(static_cast<double>(val));
+        }
     }
 
-    leafOf.assign(n, -1);
-    prim.resize(n);
-    for (int i = 0; i < n; ++i) prim[i] = i;
-    nodes.reserve(2 * n + 1);
-    rootNode = buildBVH(0, (int)n, -1);
+    g_leafOf.assign(n, -1);
+    g_prim.resize(n);
+    for (int i = 0; i < n; ++i) {
+        g_prim[i] = i;
+    }
+    g_nodes.reserve(static_cast<std::size_t>(2) * n + 1);
+    g_root = buildBVH(0, static_cast<int>(n), -1);
 
-    string out; out.reserve((size_t)q * 4);
+    std::string out;
+    out.reserve(static_cast<std::size_t>(q) * 4);
     char numbuf[16];
+
     for (int qi = 0; qi < q; ++qi) {
-        long long qtype, ox, oy, oz, dx, dy, dz, d;
-        in.readLL(qtype);
-        in.readLL(ox); in.readLL(oy); in.readLL(oz);
-        in.readLL(dx); in.readLL(dy); in.readLL(dz); in.readLL(d);
-        ld bestT; int bestIdx;
-        query(ox, oy, oz, dx, dy, dz, bestT, bestIdx);
-        int len = snprintf(numbuf, sizeof(numbuf), "%d\n", bestIdx);
+        long long qtype = 0, ox = 0, oy = 0, oz = 0, dx = 0, dy = 0, dz = 0, d = 0;
+        in.readLL(qtype);  // 射线脉冲类型恒为 2
+        in.readLL(ox);
+        in.readLL(oy);
+        in.readLL(oz);
+        in.readLL(dx);
+        in.readLL(dy);
+        in.readLL(dz);
+        in.readLL(d);
+
+        ld bestT = kInf;
+        int bestIdx = -1;
+        query(static_cast<ld>(ox), static_cast<ld>(oy), static_cast<ld>(oz),
+              static_cast<ld>(dx), static_cast<ld>(dy), static_cast<ld>(dz),
+              bestT, bestIdx);
+
+        const int len = std::snprintf(numbuf, sizeof(numbuf), "%d\n", bestIdx);
         out.append(numbuf, len);
+
+        // 命中且推动距离 > 0 -> 沿 normalize(D) 平移 d
         if (bestIdx >= 0 && d > 0) {
-            ld dl = sqrtl((ld)dx * dx + (ld)dy * dy + (ld)dz * dz);
-            ld scale = (ld)d / dl;
-            ld sx = (ld)dx * scale, sy = (ld)dy * scale, sz = (ld)dz * scale;
-            long long o = objOff[bestIdx];
-            int tp = objType[bestIdx];
-            if (tp == 3) {
-                for (int v = 0; v < 3; ++v) { P[o + v * 3] += (double)sx; P[o + v * 3 + 1] += (double)sy; P[o + v * 3 + 2] += (double)sz; }
-            } else { P[o] += (double)sx; P[o + 1] += (double)sy; P[o + 2] += (double)sz; }
+            const ld dl = std::sqrt(static_cast<ld>(dx) * dx + static_cast<ld>(dy) * dy + static_cast<ld>(dz) * dz);
+            const ld scale = static_cast<ld>(d) / dl;
+            const ld sx = static_cast<ld>(dx) * scale;
+            const ld sy = static_cast<ld>(dy) * scale;
+            const ld sz = static_cast<ld>(dz) * scale;
+            const long long o = g_off[bestIdx];
+            if (g_type[bestIdx] == 3) {  // 三角面片: 三个顶点同时平移
+                for (int v = 0; v < 3; ++v) {
+                    g_param[o + v * 3] += static_cast<double>(sx);
+                    g_param[o + v * 3 + 1] += static_cast<double>(sy);
+                    g_param[o + v * 3 + 2] += static_cast<double>(sz);
+                }
+            } else {  // 其余: 中心点平移
+                g_param[o] += static_cast<double>(sx);
+                g_param[o + 1] += static_cast<double>(sy);
+                g_param[o + 2] += static_cast<double>(sz);
+            }
             refit(bestIdx);
         }
     }
-    fwrite(out.data(), 1, out.size(), stdout);
+
+    std::fwrite(out.data(), 1, out.size(), stdout);
     return 0;
 }
