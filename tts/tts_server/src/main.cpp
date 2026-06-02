@@ -96,14 +96,25 @@ void playback_worker(DoubleMessageQueue &queue, AudioPlayer &player) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model_path>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <model_path> [--dump <prefix>]" << std::endl;
+        std::cerr << "  --dump <prefix>   also write each synthesized segment to <prefix>_NNNN.wav" << std::endl;
         return 1;
+    }
+
+    std::string dump_prefix;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--dump" && i + 1 < argc) {
+            dump_prefix = argv[++i];
+        }
     }
 
     try {
     
         TTSModel model(argv[1]);
-        AudioPlayer player;
+        AudioPlayer player = dump_prefix.empty()
+            ? AudioPlayer()
+            : AudioPlayer(dump_prefix);
         DoubleMessageQueue queue;
 
         std::thread synthesis_thread(synthesis_worker, std::ref(queue), std::ref(model));
