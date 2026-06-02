@@ -1,0 +1,10 @@
+6
+/src/common/utils.cpp
+/src/common/string_utils.cpp
+/src/utils/config_loader.cpp
+/test/utils/test_string.cpp
+/docs/manual.md
+/README.md
+2
+UTILS
+CoNfIg XmL
