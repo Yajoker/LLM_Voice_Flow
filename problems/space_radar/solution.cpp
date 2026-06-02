@@ -72,7 +72,9 @@ bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
         ld a = dot3(dx, dy, dz, dx, dy, dz);
         ld b = 2 * dot3(mx, my, mz, dx, dy, dz);
         ld disc = b * b - 4 * a * c;
-        if (disc < 0) return false;
+        ld dlim = 1e-9L * (fabsl(b * b) + fabsl(4 * a * c) + 1);
+        if (disc < -dlim) return false;
+        if (disc < dlim) disc = 0;                     // |disc|<=容差 -> 视为相切
         ld sq = sqrtl(disc);
         ld t0 = (-b - sq) / (2 * a);                  // 近交点
         if (t0 >= -EPS) { tout = t0 > 0 ? t0 : 0; return true; }
@@ -139,7 +141,9 @@ bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
         ld C0 = op2 - r * r;
         if (A > EPS) {
             ld disc = B * B - 4 * A * C0;
-            if (disc >= 0) {
+            ld dlim = 1e-9L * (fabsl(B * B) + fabsl(4 * A * C0) + 1);
+            if (disc >= -dlim) {
+                if (disc < dlim) disc = 0;            // |disc|<=容差 -> 视为相切
                 ld sq = sqrtl(disc);
                 ld roots[2] = {(-B - sq) / (2 * A), (-B + sq) / (2 * A)};
                 for (int s = 0; s < 2; ++s) {

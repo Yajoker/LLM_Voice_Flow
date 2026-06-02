@@ -17,14 +17,15 @@
 #include <utility>
 #include <vector>
 
-using ld = long double;
+using ld = double;  // 题面建议 epsilon=1e-9 且精度歧义极小, 按 double 设计(已与 long double 对拍一致)
 
 namespace {
 
-constexpr ld kEps = 1e-9L;     // 精确判定容差
-constexpr double kEpsB = 1e-6; // 包围盒(double)容差
-constexpr ld kInf = 1e300L;
+constexpr ld kEps = 1e-9;      // 精确判定容差
+constexpr double kEpsB = 1e-6; // 包围盒容差
+constexpr ld kInf = 1e300;
 constexpr double kInfB = 1e300;
+constexpr int kLeafSize = 12;  // 叶子分桶: 一个叶子最多容纳的物体数
 
 // ----------------------------- 快速输入 -----------------------------
 class FastInput {
@@ -100,9 +101,13 @@ bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
         }
         const ld a = dot3(dx, dy, dz, dx, dy, dz);
         const ld b = 2 * dot3(mx, my, mz, dx, dy, dz);
-        const ld disc = b * b - 4 * a * c;
-        if (disc < 0) {
+        ld disc = b * b - 4 * a * c;
+        const ld dlim = 1e-9 * (std::fabs(b * b) + std::fabs(4 * a * c) + 1);
+        if (disc < -dlim) {
             return false;
+        }
+        if (disc < dlim) {  // |disc|<=容差 -> 视为相切, 避免 sqrt 放大噪声
+            disc = 0;
         }
         const ld t0 = (-b - std::sqrt(disc)) / (2 * a);  // 近交点
         if (t0 >= -kEps) {
@@ -195,8 +200,12 @@ bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
         const ld b = 2 * dot3(opx, opy, opz, dpx, dpy, dpz);
         const ld c0 = op2 - r * r;
         if (a > kEps) {
-            const ld disc = b * b - 4 * a * c0;
-            if (disc >= 0) {
+            ld disc = b * b - 4 * a * c0;
+            const ld dlim = 1e-9 * (std::fabs(b * b) + std::fabs(4 * a * c0) + 1);
+            if (disc >= -dlim) {
+                if (disc < dlim) {  // |disc|<=容差 -> 视为相切, 避免 sqrt 放大噪声
+                    disc = 0;
+                }
                 const ld sq = std::sqrt(disc);
                 const ld roots[2] = {(-b - sq) / (2 * a), (-b + sq) / (2 * a)};
                 for (int s = 0; s < 2; ++s) {
@@ -327,10 +336,11 @@ void objAABB(int i, double lo[3], double hi[3]) {
 struct Node {
     double lo[3];
     double hi[3];
-    int left;
-    int right;
+    int left;    // 内部节点左孩子; 叶子为 -1
+    int right;   // 内部节点右孩子
     int parent;
-    int obj;     // 叶子为物体下标, 内部节点为 -1
+    int start;   // 叶子: g_prim 中物体区间起点
+    int count;   // 叶子: 物体个数; 内部节点为 0
     int minIdx;  // 子树内最小物体编号
 };
 
@@ -362,11 +372,14 @@ int buildBVH(int l, int r, int parent) {
     }
     g_nodes[id].minIdx = minIdx;
 
-    if (r - l == 1) {
+    if (r - l <= kLeafSize) {  // 叶子: 容纳 [l, r) 区间内的物体
         g_nodes[id].left = -1;
         g_nodes[id].right = -1;
-        g_nodes[id].obj = g_prim[l];
-        g_leafOf[g_prim[l]] = id;
+        g_nodes[id].start = l;
+        g_nodes[id].count = r - l;
+        for (int k = l; k < r; ++k) {
+            g_leafOf[g_prim[k]] = id;
+        }
         return id;
     }
 
@@ -402,7 +415,7 @@ int buildBVH(int l, int r, int parent) {
                          });
     }
 
-    g_nodes[id].obj = -1;
+    g_nodes[id].count = 0;
     const int lc = buildBVH(l, mid, id);
     const int rc = buildBVH(mid, r, id);
     g_nodes[id].left = lc;
@@ -412,8 +425,18 @@ int buildBVH(int l, int r, int parent) {
 
 void refit(int objIdx) {
     int id = g_leafOf[objIdx];
-    double lo[3], hi[3];
-    objAABB(objIdx, lo, hi);
+    double lo[3] = {kInfB, kInfB, kInfB};
+    double hi[3] = {-kInfB, -kInfB, -kInfB};
+    const int st = g_nodes[id].start;
+    const int cnt = g_nodes[id].count;
+    for (int k = st; k < st + cnt; ++k) {  // 叶子盒 = 桶内全部物体的并集
+        double blo[3], bhi[3];
+        objAABB(g_prim[k], blo, bhi);
+        for (int a = 0; a < 3; ++a) {
+            lo[a] = std::min(lo[a], blo[a]);
+            hi[a] = std::max(hi[a], bhi[a]);
+        }
+    }
     for (int a = 0; a < 3; ++a) {
         g_nodes[id].lo[a] = lo[a];
         g_nodes[id].hi[a] = hi[a];
@@ -479,116 +502,134 @@ inline bool rayAABB(const Node &nd, const Ray &ray, double &enter) {
     return true;
 }
 
-std::vector<int> g_stk;  // 复用的遍历栈
+// 预分配遍历栈 (手写下标栈, 避免容器开销)
+std::vector<int> g_stkId;
+std::vector<double> g_stkT;
+
+inline bool originInBox(const Node &nd, const Ray &ray) {
+    for (int a = 0; a < 3; ++a) {
+        if (ray.o[a] < nd.lo[a] - kEpsB || ray.o[a] > nd.hi[a] + kEpsB) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // 阶段 B: 找出包含射线起点(t<=kEps, 即起点落在闭集内/边界)的最小编号物体; 不存在返回 -1.
 // 关键剪枝: 子树最小编号 >= 当前最优时无法更优; 起点不在节点包围盒内则整棵子树无包含.
 // 按 minIdx 较小的子节点优先遍历, 重叠堆叠场景下可迅速收敛到最小编号.
+// 入栈前即过滤 (minIdx 与含点), 减少无效压栈/弹栈.
 int minIndexContaining(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz) {
     int best = INT32_MAX;
-    g_stk.clear();
-    g_stk.push_back(g_root);
+    if (g_nodes[g_root].minIdx >= best || !originInBox(g_nodes[g_root], ray)) {
+        return -1;
+    }
+    int sp = 0;
+    g_stkId[sp++] = g_root;
 
-    while (!g_stk.empty()) {
-        const int id = g_stk.back();
-        g_stk.pop_back();
+    while (sp > 0) {
+        const int id = g_stkId[--sp];
         const Node &nd = g_nodes[id];
 
-        if (nd.minIdx >= best) {
-            continue;  // 子树编号都不更小 -> 剪枝
-        }
-        bool inBox = true;  // 起点必须在包围盒内, 否则子树内无物体能包含它
-        for (int a = 0; a < 3; ++a) {
-            if (ray.o[a] < nd.lo[a] - kEpsB || ray.o[a] > nd.hi[a] + kEpsB) {
-                inBox = false;
-                break;
-            }
-        }
-        if (!inBox) {
+        if (nd.minIdx >= best) {  // best 可能已变小 -> 复检
             continue;
         }
 
-        if (nd.obj >= 0) {  // 叶子
-            ld t;
-            if (hitObj(nd.obj, ox, oy, oz, dx, dy, dz, t) && t <= kEps && nd.obj < best) {
-                best = nd.obj;
+        if (nd.left == -1) {  // 叶子: 测试桶内每个物体
+            const int st = nd.start, cnt = nd.count;
+            for (int k = st; k < st + cnt; ++k) {
+                const int oi = g_prim[k];
+                if (oi >= best) {
+                    continue;
+                }
+                ld t;
+                if (hitObj(oi, ox, oy, oz, dx, dy, dz, t) && t <= kEps) {
+                    best = oi;
+                }
             }
             continue;
         }
 
-        const int lc = nd.left;
-        const int rc = nd.right;
-        if (g_nodes[lc].minIdx <= g_nodes[rc].minIdx) {  // 较小 minIdx 后进先出 -> 先处理
-            g_stk.push_back(rc);
-            g_stk.push_back(lc);
-        } else {
-            g_stk.push_back(lc);
-            g_stk.push_back(rc);
+        int lc = nd.left;
+        int rc = nd.right;
+        if (g_nodes[lc].minIdx > g_nodes[rc].minIdx) {  // 让 lc 为 minIdx 较小者
+            std::swap(lc, rc);
+        }
+        const bool okL = g_nodes[lc].minIdx < best && originInBox(g_nodes[lc], ray);
+        const bool okR = g_nodes[rc].minIdx < best && originInBox(g_nodes[rc], ray);
+        if (okR) {  // 较大 minIdx 先入栈, 较小者后入栈先弹出
+            g_stkId[sp++] = rc;
+        }
+        if (okL) {
+            g_stkId[sp++] = lc;
         }
     }
     return best == INT32_MAX ? -1 : best;
 }
 
 // 阶段 A: 起点不在任何物体内时, 求最近命中(t>0). 最近优先遍历 + 入射 t 剪枝.
+// 栈中缓存包围盒入射 t, 弹栈时无需重算射线-盒测试.
 void queryNearest(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &bestT, int &bestIdx) {
     bestT = kInf;
     bestIdx = -1;
 
-    g_stk.clear();
     double rootEnter;
     if (!rayAABB(g_nodes[g_root], ray, rootEnter)) {
         return;
     }
-    g_stk.push_back(g_root);
+    int sp = 0;
+    g_stkId[sp] = g_root;
+    g_stkT[sp] = rootEnter;
+    ++sp;
 
-    while (!g_stk.empty()) {
-        const int id = g_stk.back();
-        g_stk.pop_back();
+    while (sp > 0) {
+        --sp;
+        const int id = g_stkId[sp];
+        const double enter = g_stkT[sp];
+        const double bt = static_cast<double>(bestT);
+        if (bestIdx != -1 && enter > bt + 1e-9 * (bt > 1.0 ? bt : 1.0)) {
+            continue;  // bestT 已收紧, 该盒整体更远
+        }
         const Node &nd = g_nodes[id];
 
-        if (bestIdx != -1) {
-            double enter;
-            if (!rayAABB(nd, ray, enter)) {
-                continue;
-            }
-            const double tol = 1e-9 * std::max(1.0, std::fabs(static_cast<double>(bestT)));
-            if (enter > static_cast<double>(bestT) + tol) {  // 整盒都比当前最优更远
-                continue;
-            }
-        }
-
-        if (nd.obj >= 0) {  // 叶子
-            ld t;
-            if (hitObj(nd.obj, ox, oy, oz, dx, dy, dz, t)) {
-                const ld tol = 1e-9L * std::fmax(static_cast<ld>(1.0L), std::fmax(std::fabs(t), std::fabs(bestT)));
-                if (bestIdx == -1 || t < bestT - tol) {
-                    bestT = t;
-                    bestIdx = nd.obj;
-                } else if (std::fabs(t - bestT) <= tol && nd.obj < bestIdx) {
-                    bestIdx = nd.obj;
+        if (nd.left == -1) {  // 叶子: 测试桶内每个物体
+            const int st = nd.start, cnt = nd.count;
+            for (int k = st; k < st + cnt; ++k) {
+                const int oi = g_prim[k];
+                ld t;
+                if (hitObj(oi, ox, oy, oz, dx, dy, dz, t)) {
+                    const ld tol = 1e-9 * std::fmax(static_cast<ld>(1.0), std::fmax(std::fabs(t), std::fabs(bestT)));
+                    if (bestIdx == -1 || t < bestT - tol) {
+                        bestT = t;
+                        bestIdx = oi;
+                    } else if (std::fabs(t - bestT) <= tol && oi < bestIdx) {
+                        bestIdx = oi;
+                    }
                 }
             }
             continue;
         }
 
-        // 先入栈较远者, 后处理较近者(后进先出, 近处优先以尽快收紧 bestT)
         const int lc = nd.left;
         const int rc = nd.right;
-        double el, er;
+        double el = 0.0, er = 0.0;
         const bool hl = rayAABB(g_nodes[lc], ray, el);
         const bool hr = rayAABB(g_nodes[rc], ray, er);
+        const double bt2 = static_cast<double>(bestT);
+        const double lim = bt2 + 1e-9 * (bt2 > 1.0 ? bt2 : 1.0);
+        // 先入栈较远者, 后入栈较近者(先弹出) -> 尽快收紧 bestT
         if (hl && hr) {
             if (el <= er) {
-                g_stk.push_back(rc);
-                g_stk.push_back(lc);
+                if (bestIdx == -1 || er <= lim) { g_stkId[sp] = rc; g_stkT[sp] = er; ++sp; }
+                g_stkId[sp] = lc; g_stkT[sp] = el; ++sp;
             } else {
-                g_stk.push_back(lc);
-                g_stk.push_back(rc);
+                if (bestIdx == -1 || el <= lim) { g_stkId[sp] = lc; g_stkT[sp] = el; ++sp; }
+                g_stkId[sp] = rc; g_stkT[sp] = er; ++sp;
             }
         } else if (hl) {
-            g_stk.push_back(lc);
+            g_stkId[sp] = lc; g_stkT[sp] = el; ++sp;
         } else if (hr) {
-            g_stk.push_back(rc);
+            g_stkId[sp] = rc; g_stkT[sp] = er; ++sp;
         }
     }
 }
@@ -628,6 +669,10 @@ int main() {
     }
     g_nodes.reserve(static_cast<std::size_t>(2) * n + 1);
     g_root = buildBVH(0, static_cast<int>(n), -1);
+
+    // 遍历栈容量上限为节点总数 + 余量
+    g_stkId.resize(g_nodes.size() + 16);
+    g_stkT.resize(g_nodes.size() + 16);
 
     std::string out;
     out.reserve(static_cast<std::size_t>(q) * 4);
