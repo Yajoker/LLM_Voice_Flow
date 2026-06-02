@@ -1,10 +1,12 @@
 // 太空探测与动态几何体查询 —— 加速版 (BVH + 命中后刷新包围盒)
 // ---------------------------------------------------------------------------
-// 与暴力版判定逻辑完全一致, 但用 BVH 做空间剪枝:
-//   - 建树一次; 每次查询沿射线遍历 BVH, 按包围盒入射 t 剪枝, 找最近命中;
-//   - 物体被推动后只重算其叶子 AABB 并自底向上刷新祖先 AABB (始终保守正确);
-//   - 平局规则: t 相等(容差内)取编号最小者; 剪枝阈值带容差, 避免漏掉同 t 小编号.
-// 复杂度约 O((n+q)*log n) (包围盒变松时退化, 但结果恒正确).
+// 判定逻辑与暴力版完全一致, 用 BVH 做空间剪枝, 并针对超时做了重点优化:
+//   1. 遍历用 double + 预计算方向倒数, 大幅降低常数 (精确命中仍用 long double);
+//   2. 每个节点记录子树最小物体编号 minIdx;
+//      命中 t=0 后, 用 "包围盒入射 t" 与 "minIdx >= 当前最优编号" 双重剪枝,
+//      彻底解决 "大量物体堆叠且射线起点在其内部(全部 t=0)" 的最坏情况;
+//   3. 物体被推动后只重算其叶子 AABB 并自底向上刷新祖先 (始终保守正确).
+// 平局规则: t 相等(容差内)取编号最小者; 剪枝阈值带容差, 不会漏掉同 t 小编号.
 // 标准: C++17.
 // ---------------------------------------------------------------------------
 #include <algorithm>
@@ -19,8 +21,10 @@ using ld = long double;
 
 namespace {
 
-constexpr ld kEps = 1e-9L;
+constexpr ld kEps = 1e-9L;     // 精确判定容差
+constexpr double kEpsB = 1e-6; // 包围盒(double)容差
 constexpr ld kInf = 1e300L;
+constexpr double kInfB = 1e300;
 
 // ----------------------------- 快速输入 -----------------------------
 class FastInput {
@@ -274,7 +278,7 @@ bool hitObj(int i, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tout) {
     return false;
 }
 
-// ----------------------------- 物体 AABB -----------------------------
+// ----------------------------- 物体 AABB (double, 向外略扩保守) -----------------------------
 void objAABB(int i, double lo[3], double hi[3]) {
     const long long o = g_off[i];
     const int tp = g_type[i];
@@ -313,9 +317,9 @@ void objAABB(int i, double lo[3], double hi[3]) {
             hi[a] = std::max({w0, w1, w2});
         }
     }
-    for (int a = 0; a < 3; ++a) {  // 给保守容差, 规避浮点边界
-        lo[a] -= 1e-6;
-        hi[a] += 1e-6;
+    for (int a = 0; a < 3; ++a) {  // 向外略扩, 规避浮点边界(保证保守)
+        lo[a] -= kEpsB;
+        hi[a] += kEpsB;
     }
 }
 
@@ -326,7 +330,8 @@ struct Node {
     int left;
     int right;
     int parent;
-    int obj;  // 叶子为物体下标, 内部节点为 -1
+    int obj;     // 叶子为物体下标, 内部节点为 -1
+    int minIdx;  // 子树内最小物体编号
 };
 
 std::vector<Node> g_nodes;
@@ -339,8 +344,9 @@ int buildBVH(int l, int r, int parent) {
     g_nodes.push_back(Node());
     g_nodes[id].parent = parent;
 
-    double lo[3] = {kInf, kInf, kInf};
-    double hi[3] = {-kInf, -kInf, -kInf};
+    double lo[3] = {kInfB, kInfB, kInfB};
+    double hi[3] = {-kInfB, -kInfB, -kInfB};
+    int minIdx = INT32_MAX;
     for (int k = l; k < r; ++k) {
         double blo[3], bhi[3];
         objAABB(g_prim[k], blo, bhi);
@@ -348,11 +354,13 @@ int buildBVH(int l, int r, int parent) {
             lo[a] = std::min(lo[a], blo[a]);
             hi[a] = std::max(hi[a], bhi[a]);
         }
+        minIdx = std::min(minIdx, g_prim[k]);
     }
     for (int a = 0; a < 3; ++a) {
         g_nodes[id].lo[a] = lo[a];
         g_nodes[id].hi[a] = hi[a];
     }
+    g_nodes[id].minIdx = minIdx;
 
     if (r - l == 1) {
         g_nodes[id].left = -1;
@@ -363,8 +371,8 @@ int buildBVH(int l, int r, int parent) {
     }
 
     // 选最长轴, 按质心中位数划分
-    double cenLo[3] = {kInf, kInf, kInf};
-    double cenHi[3] = {-kInf, -kInf, -kInf};
+    double cenLo[3] = {kInfB, kInfB, kInfB};
+    double cenHi[3] = {-kInfB, -kInfB, -kInfB};
     for (int k = l; k < r; ++k) {
         double blo[3], bhi[3];
         objAABB(g_prim[k], blo, bhi);
@@ -431,21 +439,25 @@ void refit(int objIdx) {
     }
 }
 
-// 射线-AABB: 返回是否相交(t>=0), tEnter 为入射参数(起点在盒内则 0)
-inline bool rayAABB(const Node &nd, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &tEnter) {
-    const ld O[3] = {ox, oy, oz};
-    const ld D[3] = {dx, dy, dz};
-    ld tmin = 0;
-    ld tmax = kInf;
+// 预计算的射线数据 (double, 加速 BVH 遍历)
+struct Ray {
+    double o[3];
+    double inv[3];
+    bool parallel[3];  // 方向分量近 0
+};
+
+// 射线-AABB: 返回是否相交(t>=0), enter 为入射参数(起点在盒内则 0)
+inline bool rayAABB(const Node &nd, const Ray &ray, double &enter) {
+    double tmin = 0.0;
+    double tmax = kInfB;
     for (int a = 0; a < 3; ++a) {
-        if (std::fabs(D[a]) <= kEps) {
-            if (O[a] < static_cast<ld>(nd.lo[a]) - kEps || O[a] > static_cast<ld>(nd.hi[a]) + kEps) {
+        if (ray.parallel[a]) {
+            if (ray.o[a] < nd.lo[a] - kEpsB || ray.o[a] > nd.hi[a] + kEpsB) {
                 return false;
             }
         } else {
-            const ld inv = 1.0L / D[a];
-            ld ta = (static_cast<ld>(nd.lo[a]) - O[a]) * inv;
-            ld tb = (static_cast<ld>(nd.hi[a]) - O[a]) * inv;
+            double ta = (nd.lo[a] - ray.o[a]) * ray.inv[a];
+            double tb = (nd.hi[a] - ray.o[a]) * ray.inv[a];
             if (ta > tb) {
                 std::swap(ta, tb);
             }
@@ -455,43 +467,92 @@ inline bool rayAABB(const Node &nd, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld
             if (tb < tmax) {
                 tmax = tb;
             }
-            if (tmin > tmax + kEps) {
+            if (tmin > tmax + kEpsB) {
                 return false;
             }
         }
     }
-    if (tmax < -kEps) {
+    if (tmax < -kEpsB) {
         return false;
     }
-    tEnter = tmin;
+    enter = tmin;
     return true;
 }
 
-void query(ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &bestT, int &bestIdx) {
+std::vector<int> g_stk;  // 复用的遍历栈
+
+// 阶段 B: 找出包含射线起点(t<=kEps, 即起点落在闭集内/边界)的最小编号物体; 不存在返回 -1.
+// 关键剪枝: 子树最小编号 >= 当前最优时无法更优; 起点不在节点包围盒内则整棵子树无包含.
+// 按 minIdx 较小的子节点优先遍历, 重叠堆叠场景下可迅速收敛到最小编号.
+int minIndexContaining(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz) {
+    int best = INT32_MAX;
+    g_stk.clear();
+    g_stk.push_back(g_root);
+
+    while (!g_stk.empty()) {
+        const int id = g_stk.back();
+        g_stk.pop_back();
+        const Node &nd = g_nodes[id];
+
+        if (nd.minIdx >= best) {
+            continue;  // 子树编号都不更小 -> 剪枝
+        }
+        bool inBox = true;  // 起点必须在包围盒内, 否则子树内无物体能包含它
+        for (int a = 0; a < 3; ++a) {
+            if (ray.o[a] < nd.lo[a] - kEpsB || ray.o[a] > nd.hi[a] + kEpsB) {
+                inBox = false;
+                break;
+            }
+        }
+        if (!inBox) {
+            continue;
+        }
+
+        if (nd.obj >= 0) {  // 叶子
+            ld t;
+            if (hitObj(nd.obj, ox, oy, oz, dx, dy, dz, t) && t <= kEps && nd.obj < best) {
+                best = nd.obj;
+            }
+            continue;
+        }
+
+        const int lc = nd.left;
+        const int rc = nd.right;
+        if (g_nodes[lc].minIdx <= g_nodes[rc].minIdx) {  // 较小 minIdx 后进先出 -> 先处理
+            g_stk.push_back(rc);
+            g_stk.push_back(lc);
+        } else {
+            g_stk.push_back(lc);
+            g_stk.push_back(rc);
+        }
+    }
+    return best == INT32_MAX ? -1 : best;
+}
+
+// 阶段 A: 起点不在任何物体内时, 求最近命中(t>0). 最近优先遍历 + 入射 t 剪枝.
+void queryNearest(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &bestT, int &bestIdx) {
     bestT = kInf;
     bestIdx = -1;
 
-    static std::vector<int> stk;
-    stk.clear();
-
-    ld rootEnter;
-    if (!rayAABB(g_nodes[g_root], ox, oy, oz, dx, dy, dz, rootEnter)) {
+    g_stk.clear();
+    double rootEnter;
+    if (!rayAABB(g_nodes[g_root], ray, rootEnter)) {
         return;
     }
-    stk.push_back(g_root);
+    g_stk.push_back(g_root);
 
-    while (!stk.empty()) {
-        const int id = stk.back();
-        stk.pop_back();
+    while (!g_stk.empty()) {
+        const int id = g_stk.back();
+        g_stk.pop_back();
         const Node &nd = g_nodes[id];
 
         if (bestIdx != -1) {
-            const ld tol = 1e-9L * std::fmax(static_cast<ld>(1.0L), std::fabs(bestT));
-            ld enter;
-            if (!rayAABB(nd, ox, oy, oz, dx, dy, dz, enter)) {
+            double enter;
+            if (!rayAABB(nd, ray, enter)) {
                 continue;
             }
-            if (enter > bestT + tol) {  // 整个盒都比当前最优更远 -> 剪枝
+            const double tol = 1e-9 * std::max(1.0, std::fabs(static_cast<double>(bestT)));
+            if (enter > static_cast<double>(bestT) + tol) {  // 整盒都比当前最优更远
                 continue;
             }
         }
@@ -510,24 +571,24 @@ void query(ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, ld &bestT, int &bestIdx) {
             continue;
         }
 
-        // 先入栈较远者, 后处理较近者(后进先出)
+        // 先入栈较远者, 后处理较近者(后进先出, 近处优先以尽快收紧 bestT)
         const int lc = nd.left;
         const int rc = nd.right;
-        ld el, er;
-        const bool hl = rayAABB(g_nodes[lc], ox, oy, oz, dx, dy, dz, el);
-        const bool hr = rayAABB(g_nodes[rc], ox, oy, oz, dx, dy, dz, er);
+        double el, er;
+        const bool hl = rayAABB(g_nodes[lc], ray, el);
+        const bool hr = rayAABB(g_nodes[rc], ray, er);
         if (hl && hr) {
             if (el <= er) {
-                stk.push_back(rc);
-                stk.push_back(lc);
+                g_stk.push_back(rc);
+                g_stk.push_back(lc);
             } else {
-                stk.push_back(lc);
-                stk.push_back(rc);
+                g_stk.push_back(lc);
+                g_stk.push_back(rc);
             }
         } else if (hl) {
-            stk.push_back(lc);
+            g_stk.push_back(lc);
         } else if (hr) {
-            stk.push_back(rc);
+            g_stk.push_back(rc);
         }
     }
 }
@@ -583,11 +644,30 @@ int main() {
         in.readLL(dz);
         in.readLL(d);
 
-        ld bestT = kInf;
-        int bestIdx = -1;
-        query(static_cast<ld>(ox), static_cast<ld>(oy), static_cast<ld>(oz),
-              static_cast<ld>(dx), static_cast<ld>(dy), static_cast<ld>(dz),
-              bestT, bestIdx);
+        Ray ray;
+        ray.o[0] = static_cast<double>(ox);
+        ray.o[1] = static_cast<double>(oy);
+        ray.o[2] = static_cast<double>(oz);
+        const double dd[3] = {static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz)};
+        for (int a = 0; a < 3; ++a) {
+            if (dd[a] == 0.0) {
+                ray.parallel[a] = true;
+                ray.inv[a] = 0.0;
+            } else {
+                ray.parallel[a] = false;
+                ray.inv[a] = 1.0 / dd[a];
+            }
+        }
+
+        const ld lox = static_cast<ld>(ox), loy = static_cast<ld>(oy), loz = static_cast<ld>(oz);
+        const ld ldx = static_cast<ld>(dx), ldy = static_cast<ld>(dy), ldz = static_cast<ld>(dz);
+
+        // 阶段 B: 起点是否落在某物体内(t=0). 若有, t=0 必胜, 取其中最小编号.
+        int bestIdx = minIndexContaining(ray, lox, loy, loz, ldx, ldy, ldz);
+        if (bestIdx == -1) {  // 阶段 A: 否则求最近命中
+            ld bestT;
+            queryNearest(ray, lox, loy, loz, ldx, ldy, ldz, bestT, bestIdx);
+        }
 
         const int len = std::snprintf(numbuf, sizeof(numbuf), "%d\n", bestIdx);
         out.append(numbuf, len);
