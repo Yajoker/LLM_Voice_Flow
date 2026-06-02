@@ -271,6 +271,34 @@ bool hitObj(int tp, const double *p, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz, l
     return false;
 }
 
+// 点包含测试 (与 hitObj 的"起点在内部/边界"判定完全一致). 三角片不在此处理.
+inline bool containsPoint(int tp, const double *p, ld px, ld py, ld pz) {
+    const ld mx = px - p[0], my = py - p[1], mz = pz - p[2];
+    if (tp == 0) {  // 球体
+        return dot3(mx, my, mz, mx, my, mz) <= p[3] * p[3] + kEps;
+    }
+    if (tp == 1) {  // OBB
+        for (int k = 0; k < 3; ++k) {
+            const ld vx = p[3 + k * 3], vy = p[4 + k * 3], vz = p[5 + k * 3];
+            const ld aa = dot3(vx, vy, vz, vx, vy, vz);
+            if (std::fabs(dot3(mx, my, mz, vx, vy, vz)) > aa + kEps) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // 圆柱体
+    const ld axv = p[3], ayv = p[4], azv = p[5], r = p[6], halfH = p[7];
+    const ld la = std::sqrt(dot3(axv, ayv, azv, axv, ayv, azv));
+    const ld hx = axv / la, hy = ayv / la, hz = azv / la;
+    const ld oa = dot3(mx, my, mz, hx, hy, hz);
+    if (std::fabs(oa) > halfH + kEps) {
+        return false;
+    }
+    const ld opx = mx - oa * hx, opy = my - oa * hy, opz = mz - oa * hz;
+    return dot3(opx, opy, opz, opx, opy, opz) <= r * r + kEps;
+}
+
 // 物体 AABB (向外略扩, 保守)
 void aabbOf(int tp, const double *p, double lo[3], double hi[3]) {
     if (tp == 0) {
@@ -525,9 +553,14 @@ int minIndexContaining(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz)
                 if (oi >= bestOrig) {
                     continue;
                 }
-                ld t;
-                // 仅需 t<=kEps 的命中, tMax 用 1e-6 即可让更远物体跳过 sqrt
-                if (hitObj(pType[k], &P[pOff[k]], ox, oy, oz, dx, dy, dz, 1e-6, t) && t <= kEps) {
+                bool in;
+                if (pType[k] == 3) {  // 三角片: 用 hitObj 保持与基准完全一致
+                    ld t;
+                    in = hitObj(3, &P[pOff[k]], ox, oy, oz, dx, dy, dz, 1e-6, t) && t <= kEps;
+                } else {  // 球/OBB/圆柱: 廉价点包含测试
+                    in = containsPoint(pType[k], &P[pOff[k]], ox, oy, oz);
+                }
+                if (in) {
                     bestOrig = oi;
                     bestPos = k;
                 }
@@ -550,7 +583,7 @@ int minIndexContaining(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz)
     return bestPos;
 }
 
-// 阶段 A: 最近命中(t>0). 返回 position; 无则 -1.
+// 阶段 A: 最近命中(t>0). DFS + 最近孩子优先 + 入射 t 剪枝. 返回 position; 无则 -1.
 int queryNearest(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz) {
     ld bestT = kInf;
     int bestOrig = INT32_MAX;
@@ -569,7 +602,7 @@ int queryNearest(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz) {
         --sp;
         const int id = g_stkId[sp];
         const double enter = g_stkT[sp];
-        if (bestPos != -1 && enter > bestT + 1e-9 * (bestT > 1.0 ? bestT : 1.0)) {
+        if (bestPos != -1 && enter > bestT + 1e-7 * (std::fabs(bestT) + 1)) {
             continue;
         }
         const Node &nd = g_nodes[id];
@@ -599,8 +632,8 @@ int queryNearest(const Ray &ray, ld ox, ld oy, ld oz, ld dx, ld dy, ld dz) {
         double el = 0.0, er = 0.0;
         const bool hl = rayAABB(g_nodes[lc], ray, el);
         const bool hr = rayAABB(g_nodes[rc], ray, er);
-        const double lim = bestT + 1e-9 * (bestT > 1.0 ? bestT : 1.0);
-        if (hl && hr) {
+        const double lim = bestPos == -1 ? kInfB : bestT + 1e-7 * (std::fabs(bestT) + 1);
+        if (hl && hr) {  // 较远者先入栈, 较近者后入栈先弹出
             if (el <= er) {
                 if (bestPos == -1 || er <= lim) { g_stkId[sp] = rc; g_stkT[sp] = er; ++sp; }
                 g_stkId[sp] = lc; g_stkT[sp] = el; ++sp;
