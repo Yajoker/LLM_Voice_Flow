@@ -6,12 +6,16 @@
 //   3) 结果按字典序排列，仅返回最小的前 10 条；
 //   4) 毫秒级响应。
 //
+// 匹配规则：大小写不敏感（如 "UTILS" 命中 "utils"）。索引与匹配均在小写化后的
+//           文本上进行，但输出保留路径原始大小写，排序仍按原始字节字典序。
+//
 // 算法概述：
 //   * 字典序预排序 + 去重：路径按逐字节字典序排序，其下标 rank 即字典序。
 //     因为只需“字典序最小的前 10 条”，按 rank 升序枚举候选取前 10 即可。
-//   * 3-gram 倒排索引（CSR 紧凑存储）：trigram -> 升序排列的文档 rank 列表。
-//     若路径包含某关键字，则它必然包含该关键字的全部 trigram，因此“包含关键字的
-//     文档集合”一定是该关键字任意一个 trigram 倒排表的子集。
+//   * 3-gram 倒排索引（CSR 紧凑存储）：trigram -> 升序排列的文档 rank 列表，
+//     建立在小写化文本上。若路径包含某关键字，则它必然包含该关键字的全部
+//     trigram，因此“包含关键字的文档集合”一定是该关键字任意一个 trigram 倒排
+//     表的子集。
 //   * 查询时，在所有长度 >= 3 的关键字的全部 trigram 中挑选倒排表最短者作为驱动表
 //     （候选超集），沿驱动表（天然 rank 升序）枚举候选，用 find() 校验是否真正包含
 //     全部关键字（覆盖子串连续性以及长度 < 3 的短关键字），收集到 10 条即停。
@@ -57,8 +61,9 @@ public:
                                 offset_[rank + 1] - offset_[rank]);
     }
 
-    // 查询：keywords 为一组关键字，要求路径同时包含全部关键字（顺序无关）。
-    // 结果以字典序升序写入 out_ranks，最多 kMaxResults 条。
+    // 查询：keywords 为一组关键字（调用方需保证已转为小写），要求路径同时包含
+    // 全部关键字（顺序无关，大小写不敏感）。结果以字典序升序写入 out_ranks，
+    // 最多 kMaxResults 条。
     void Search(const std::vector<std::string_view>& keywords,
                 std::vector<int>& out_ranks) const {
         out_ranks.clear();
@@ -107,6 +112,11 @@ public:
     }
 
 private:
+    // ASCII 大写转小写，其余字节保持不变。
+    static char ToLower(char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+
     // 将连续 3 字节打包为 24 位整数，作为 trigram 的键。
     static std::uint32_t Pack(const char* p) {
         return (static_cast<std::uint32_t>(static_cast<std::uint8_t>(p[0])) << 16) |
@@ -114,9 +124,10 @@ private:
                static_cast<std::uint32_t>(static_cast<std::uint8_t>(p[2]));
     }
 
-    // 校验第 rank 个路径是否包含全部关键字。
+    // 校验第 rank 个路径是否包含全部关键字（在小写化文本上比较）。
     bool MatchesAll(int rank, const std::vector<std::string_view>& keywords) const {
-        const std::string_view path = PathOf(rank);
+        const std::string_view path(lower_.data() + offset_[rank],
+                                    offset_[rank + 1] - offset_[rank]);
         for (const std::string_view& kw : keywords) {
             if (path.find(kw) == std::string_view::npos) return false;
         }
@@ -146,6 +157,10 @@ private:
             offset_.push_back(static_cast<std::uint32_t>(data_.size()));
         }
         doc_count_ = static_cast<int>(offset_.size()) - 1;
+
+        // 生成与 data_ 等长的小写化副本，供建索引与匹配使用。
+        lower_.resize(data_.size());
+        for (std::size_t i = 0; i < data_.size(); ++i) lower_[i] = ToLower(data_[i]);
     }
 
     // 构建 3-gram 倒排索引（CSR：start_ 为各 trigram 在 postings_ 中的起始位置）。
@@ -154,7 +169,7 @@ private:
         std::vector<int> seen(kTrigramSpace, -1);  // 文档内去重，避免重复计数
 
         for (int rank = 0; rank < doc_count_; ++rank) {
-            const char* p = data_.data() + offset_[rank];
+            const char* p = lower_.data() + offset_[rank];
             const int len = static_cast<int>(offset_[rank + 1] - offset_[rank]);
             for (int i = 0; i + 3 <= len; ++i) {
                 const std::uint32_t tri = Pack(p + i);
@@ -175,7 +190,7 @@ private:
         std::fill(seen.begin(), seen.end(), -1);
 
         for (int rank = 0; rank < doc_count_; ++rank) {
-            const char* p = data_.data() + offset_[rank];
+            const char* p = lower_.data() + offset_[rank];
             const int len = static_cast<int>(offset_[rank + 1] - offset_[rank]);
             for (int i = 0; i + 3 <= len; ++i) {
                 const std::uint32_t tri = Pack(p + i);
@@ -190,7 +205,8 @@ private:
     // trigram 键空间：256^3。
     static constexpr std::uint32_t kTrigramSpace = 1u << 24;
 
-    std::string data_;                    // 去重后按字典序连续存放的全部路径
+    std::string data_;                    // 去重后按字典序连续存放的全部路径（原始大小写）
+    std::string lower_;                    // 与 data_ 等长的小写化副本，用于建索引与匹配
     std::vector<std::uint32_t> offset_;   // 第 rank 个路径为 [offset_[rank], offset_[rank+1])
     std::vector<std::uint32_t> start_;     // CSR 起始偏移
     std::vector<std::uint32_t> postings_;  // 各 trigram 对应的升序 rank 列表
@@ -209,17 +225,36 @@ std::string ReadAllStdin() {
     return buffer;
 }
 
-// 简单的字符串切分：按空格/制表符拆分关键字（忽略空片段）。
-void SplitKeywords(std::string_view line, std::vector<std::string_view>& out) {
+// 按空格/制表符拆分关键字（忽略空片段），并将关键字小写化写入 scratch；
+// out 中的 string_view 指向 scratch（在所有片段写入后统一构建，避免扩容失效）。
+void SplitKeywordsLower(std::string_view line, std::string& scratch,
+                        std::vector<std::pair<std::size_t, std::size_t>>& spans,
+                        std::vector<std::string_view>& out) {
+    scratch.clear();
+    spans.clear();
     out.clear();
+
     std::size_t i = 0;
     const std::size_t n = line.size();
     while (i < n) {
         while (i < n && (line[i] == ' ' || line[i] == '\t')) ++i;
         std::size_t j = i;
         while (j < n && line[j] != ' ' && line[j] != '\t') ++j;
-        if (j > i) out.emplace_back(line.data() + i, j - i);
+        if (j > i) {
+            const std::size_t begin = scratch.size();
+            for (std::size_t k = i; k < j; ++k) {
+                const char c = line[k];
+                scratch.push_back((c >= 'A' && c <= 'Z')
+                                      ? static_cast<char>(c - 'A' + 'a')
+                                      : c);
+            }
+            spans.emplace_back(begin, scratch.size());
+        }
         i = j;
+    }
+
+    for (const auto& s : spans) {
+        out.emplace_back(scratch.data() + s.first, s.second - s.first);
     }
 }
 
@@ -294,10 +329,12 @@ int main() {
 
     std::vector<std::string_view> keywords;
     std::vector<int> ranks;
+    std::string kw_scratch;
+    std::vector<std::pair<std::size_t, std::size_t>> kw_spans;
 
     for (const auto& span : query_spans) {
         const std::string_view line(input.data() + span.first, span.second - span.first);
-        fsearch::SplitKeywords(line, keywords);
+        fsearch::SplitKeywordsLower(line, kw_scratch, kw_spans, keywords);
 
         if (keywords.empty()) {
             output.push_back('\n');
